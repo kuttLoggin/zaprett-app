@@ -19,6 +19,7 @@ import com.cherret.zaprett.data.StorageData
 import com.cherret.zaprett.utils.DownloadUtils.download
 import com.cherret.zaprett.utils.DownloadUtils.getFileSha256
 import com.cherret.zaprett.utils.DownloadUtils.registerDownloadListener
+import com.cherret.zaprett.utils.NetworkUtils.DEFAULT_REPO_URL
 import com.cherret.zaprett.utils.NetworkUtils.getRepo
 import com.cherret.zaprett.utils.NetworkUtils.resolveDependencies
 import com.cherret.zaprett.utils.checkManifestVersion
@@ -69,7 +70,7 @@ abstract class BaseRepoViewModel(application: Application) : AndroidViewModel(ap
 
     abstract fun getInstalled(): Array<StorageData>
     abstract val repoTab: RepoTab
-    val repoUrl = sharedPreferences.getString("repo_url", "https://raw.githubusercontent.com/CherretGit/zaprett-repo/refs/heads/main/index.json") ?: "https://raw.githubusercontent.com/CherretGit/zaprett-repo/refs/heads/main/index.json"
+    val repoUrl = sharedPreferences.getString("repo_url", DEFAULT_REPO_URL) ?: DEFAULT_REPO_URL
     private val Json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true

@@ -5,15 +5,19 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.cherret.zaprett.MainActivity
 import com.cherret.zaprett.R
+import com.cherret.zaprett.TvActivity
 import com.cherret.zaprett.data.ListType
 import com.cherret.zaprett.data.ServiceStatus
 import com.cherret.zaprett.utils.disableList
@@ -24,19 +28,39 @@ import com.cherret.zaprett.utils.getActiveIpsets
 import com.cherret.zaprett.utils.getActiveLists
 import com.cherret.zaprett.utils.getAppsListMode
 import com.cherret.zaprett.utils.getHostListMode
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
 class ByeDpiVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var proxyJob: Job? = null
     private lateinit var sharedPreferences: SharedPreferences
     companion object {
         private const val CHANNEL_ID = "zaprett_vpn_channel"
         private const val NOTIFICATION_ID = 1
-        var status: ServiceStatus = ServiceStatus.Disconnected
+        private const val ACTION_START = "START_VPN"
+        private const val ACTION_STOP = "STOP_VPN"
+        private val mutableStatus = MutableStateFlow(ServiceStatus.Disconnected)
+        val statusFlow = mutableStatus.asStateFlow()
+        val status: ServiceStatus get() = statusFlow.value
+
+        fun start(context: Context) {
+            ContextCompat.startForegroundService(
+                context, Intent(context, ByeDpiVpnService::class.java).setAction(ACTION_START)
+            )
+        }
+
+        fun stop(context: Context) {
+            context.startService(Intent(context, ByeDpiVpnService::class.java).setAction(ACTION_STOP))
+        }
     }
 
     @SuppressLint("ForegroundServiceType")
@@ -49,13 +73,13 @@ class ByeDpiVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         return when (intent?.action) {
-            "START_VPN" -> {
-                startForeground(NOTIFICATION_ID, createNotification())
-                setupProxy()
+            ACTION_START -> {
+                if (vpnInterface == null) setupProxy()
                 START_STICKY
             }
-            "STOP_VPN" -> {
+            ACTION_STOP -> {
                 stopProxy()
+                mutableStatus.value = ServiceStatus.Disconnected
                 stopSelf()
                 START_NOT_STICKY
             }
@@ -66,8 +90,9 @@ class ByeDpiVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        stopProxy()
+        if (status != ServiceStatus.Failed) mutableStatus.value = ServiceStatus.Disconnected
         super.onDestroy()
-        vpnInterface?.close()
     }
 
     private fun createNotificationChannel() {
@@ -83,7 +108,12 @@ class ByeDpiVpnService : VpnService() {
     }
 
     private fun createNotification(): Notification {
-        val notificationIntent = Intent(this, MainActivity::class.java)
+        val activity = if (packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)) {
+            TvActivity::class.java
+        } else {
+            MainActivity::class.java
+        }
+        val notificationIntent = Intent(this, activity)
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -99,7 +129,7 @@ class ByeDpiVpnService : VpnService() {
                 PendingIntent.getService(
                     this,
                     0,
-                    Intent(this, ByeDpiVpnService::class.java).setAction("STOP_VPN"),
+                    Intent(this, ByeDpiVpnService::class.java).setAction(ACTION_STOP),
                     PendingIntent.FLAG_IMMUTABLE,
                 )
             )
@@ -110,14 +140,21 @@ class ByeDpiVpnService : VpnService() {
 
     private fun setupProxy() {
         try {
+            startForeground(NOTIFICATION_ID, createNotification())
             startSocksProxy()
             startByeDpi()
-            status = ServiceStatus.Connected
+            mutableStatus.value = ServiceStatus.Connected
         } catch (e: Exception) {
-            Log.e("proxy", "Failed to start")
-            status = ServiceStatus.Failed
-            stopSelf()
+            failProxy(e)
+        } catch (e: LinkageError) {
+            failProxy(e)
         }
+    }
+
+    private fun failProxy(error: Throwable) {
+        Log.e("proxy", "Failed to start or keep the proxy running", error)
+        mutableStatus.value = ServiceStatus.Failed
+        stopSelf()
     }
 
     private fun startSocksProxy() {
@@ -158,7 +195,8 @@ class ByeDpiVpnService : VpnService() {
             }
         }
         Log.d("builder", builder.toString())
-        vpnInterface = builder.establish()
+        val tunnel = checkNotNull(builder.establish()) { "VPN permission was revoked" }
+        vpnInterface = tunnel
         val tun2socksConfig = """
         | misc:
         |   task-stack-size: 81920
@@ -172,21 +210,21 @@ class ByeDpiVpnService : VpnService() {
             writeText(tun2socksConfig)
             deleteOnExit()
         }
-        vpnInterface?.fd?.let { fd ->
-            TProxyService.TProxyStartService(configPath.absolutePath, fd)
+        check(TProxyService.TProxyStartService(configPath.absolutePath, tunnel.fd)) {
+            "Couldn't start the tunnel"
         }
     }
 
     private fun stopProxy() {
-        try {
-            vpnInterface?.close()
-            vpnInterface = null
-            NativeBridge().jniStopProxy()
-            TProxyService.TProxyStopService()
-            status = ServiceStatus.Disconnected
-        } catch (e: Exception) {
-            Log.e("proxy", "error stop proxy")
-        }
+        proxyJob?.cancel()
+        val tunnel = vpnInterface ?: return
+        vpnInterface = null
+        runCatching { NativeBridge().jniStopProxy() }
+            .onFailure { Log.e("proxy", "Couldn't stop ByeDPI", it) }
+        runCatching { TProxyService.TProxyStopService() }
+            .onFailure { Log.e("proxy", "Couldn't stop the tunnel", it) }
+        runCatching { tunnel.close() }
+            .onFailure { Log.e("proxy", "Couldn't close the VPN interface", it) }
     }
 
     private fun startByeDpi() {
@@ -194,19 +232,27 @@ class ByeDpiVpnService : VpnService() {
         val socksPort = sharedPreferences.getString("port", "1080")?: "1080"
         val listSet = if (getHostListMode(sharedPreferences) == ListType.whitelist) getActiveLists(sharedPreferences) else getActiveExcludeLists(sharedPreferences)
         val ipsetSet = if (getHostListMode(sharedPreferences) == ListType.whitelist) getActiveIpsets(sharedPreferences) else getActiveExcludeIpsets(sharedPreferences)
-        CoroutineScope(Dispatchers.IO).launch {
-            val args = parseArgs(
-                socksIp,
-                socksPort,
-                getActiveByeDPIStrategyContent(sharedPreferences),
-                prepareList(listSet.map { it.file }.toTypedArray()),
-                prepareIpset(ipsetSet.map { it.file }.toTypedArray()),
-                sharedPreferences)
-            val result = NativeBridge().jniStartProxy(args)
-            if (result < 0) {
-                Log.d("proxy","Failed to start byedpi proxy")
-            } else {
-                Log.d("proxy", "Byedpi proxy started successfully")
+        proxyJob = CoroutineScope(Dispatchers.Main).launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    val args = parseArgs(
+                        socksIp,
+                        socksPort,
+                        getActiveByeDPIStrategyContent(sharedPreferences),
+                        prepareList(listSet.map { it.file }.toTypedArray()),
+                        prepareIpset(ipsetSet.map { it.file }.toTypedArray()),
+                        sharedPreferences
+                    )
+                    ensureActive()
+                    NativeBridge().jniStartProxy(args)
+                }
+                failProxy(IllegalStateException("ByeDPI exited with status $result"))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failProxy(e)
+            } catch (e: LinkageError) {
+                failProxy(e)
             }
         }
     }

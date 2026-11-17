@@ -22,6 +22,7 @@
 
 -keep class com.cherret.zaprett.byedpi.TProxyService {
     native long[] TProxyGetStats();
-    native void TProxyStartService(java.lang.String, int);
-    native void TProxyStopService();
+    native boolean TProxyStartService(java.lang.String, int);
+    native boolean TProxyStopService();
+    native boolean TProxyIsRunning();
 }

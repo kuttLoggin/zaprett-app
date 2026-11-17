@@ -10,9 +10,11 @@ import com.cherret.zaprett.data.ResolveResult
 import com.cherret.zaprett.data.UpdateData
 import com.cherret.zaprett.data.UpdateInfo
 import io.ktor.client.HttpClient
+import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.isSuccess
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -25,9 +27,17 @@ import kotlinx.serialization.json.Json
 import kotlin.collections.forEach
 
 object NetworkUtils {
+    const val DEFAULT_REPO_URL = "https://raw.githubusercontent.com/CherretGit/zaprett-repo/refs/heads/main/index.json"
+
     private val client = HttpClient(OkHttp)
 
     private val json = Json { ignoreUnknownKeys = true }
+
+    suspend fun downloadArtifact(url: String): ByteArray {
+        val response = client.get(url)
+        check(response.status.isSuccess()) { "Artifact download failed: ${response.status}" }
+        return response.body()
+    }
 
     fun getRepo(url: String, filter: (RepoIndexItem) -> Boolean): Flow<Pair<List<RepoIndexItem>, List<RepoItemFull>>> = flow {
         val index = client.get(url).bodyAsText()

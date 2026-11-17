@@ -5,7 +5,8 @@ object TProxyService {
         System.loadLibrary("hev-socks5-tunnel")
     }
 
-    external fun TProxyStartService(config: String, fd: Int)
+    external fun TProxyStartService(config: String, fd: Int): Boolean
     external fun TProxyGetStats(): LongArray
-    external fun TProxyStopService()
+    external fun TProxyStopService(): Boolean
+    external fun TProxyIsRunning(): Boolean
 }
